@@ -1,0 +1,12 @@
+# Tool configuration only. The package is built by colcon through setup.py
+# (ament_python); no [build-system] table on purpose.
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]

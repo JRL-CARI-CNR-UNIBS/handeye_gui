@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# colcon / ament (if built from inside the package)
+build/
+install/
+log/
+
+# Calibration sessions and exports (keep them outside the repo)
+session*/
+*_session/
+handeye_calibration.launch.py
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
