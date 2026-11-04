@@ -22,18 +22,24 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog, QMainWindow, QMessageBox,
                                QPlainTextEdit, QTabWidget)
 
+from ..core import autosave
 from ..core.config import CalibConfig
 from ..core.coverage import coverage_report
 from ..core.evaluation import Report, evaluate
 from ..core.export import write_calibration
 from ..core.geometry import matrix_to_pose7, pose7_to_matrix
-from ..core.poses import (fibonacci_hemisphere, flange_camera_guess, flange_goal,
-                          random_camera_pose, target_in_base_guess)
+from ..core.poses import (fibonacci_hemisphere, fixed_target_guess, flange_goal, hand_eye_guess,
+                          random_camera_pose)
+from ..core.ros_names import ERROR, MOTION_FIELDS
 from ..core.session import Session, read_joint_states
+from ..core.solvers import result_parent
 from ..core.target import BoardModel
 from .tab_acquisition import AcquisitionTab
 from .tab_config import ConfigTab
 from .tab_results import ResultsTab
+
+GRAPH_REFRESH_MS = 3000     # ROS names are re-read this often
+CONFIG_TAB = 0
 
 
 class ComputeWorker(QThread):
@@ -55,9 +61,11 @@ class ComputeWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, session: Session, use_ros: bool = True, ros_args=None):
+    def __init__(self, session: Session, use_ros: bool = True, ros_args=None,
+                 restored: bool = False):
         super().__init__()
         self.session = session
+        self.autosaver = autosave.Autosaver()
         self.report: Optional[Report] = None
         self.ros = None
         self._worker: Optional[ComputeWorker] = None
@@ -74,6 +82,9 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.acq_tab, "Acquisition")
         tabs.addTab(self.results_tab, "Results")
         tabs.setCurrentIndex(1)
+        self._current_tab = 1
+        self._switching_tab = False
+        tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs = tabs
         self.setCentralWidget(tabs)
 
@@ -101,10 +112,20 @@ class MainWindow(QMainWindow):
             self.ros.sample_ready.connect(self._on_sample_ready)
             self.ros.status.connect(self.log_message)
             self.ros.error.connect(self.log_error)
+            self.ros.started_ok.connect(lambda: QTimer.singleShot(1500, self.refresh_graph))
             self.ros.start()
+            self._graph_timer = QTimer(self)
+            self._graph_timer.timeout.connect(self.refresh_graph)
+            self._graph_timer.start(GRAPH_REFRESH_MS)
         else:
             self.acq_tab.set_stability(False, {"reason": "offline mode (no ROS)"})
+            self.acq_tab.set_motion_enabled(False, "offline mode")
             self.log_message("Offline mode: acquisition and motion are disabled.")
+        if restored:
+            self._dirty = True
+            self.log_message(f"Autosaved session restored from {session.folder}: "
+                             f"{len(session.samples)} samples. Save it to keep it.")
+        self.autosaver.claim(self.session)
         self._update_title()
         self._fit_to_screen()
 
@@ -158,6 +179,8 @@ class MainWindow(QMainWindow):
         a.import_joints_requested.connect(self.import_joints)
         a.compute_requested.connect(self.compute)
         self.config_tab.config_applied.connect(self.apply_config)
+        self.config_tab.pending_changed.connect(self._on_config_pending)
+        self.config_tab.refresh_requested.connect(self.refresh_graph)
         self.results_tab.exclusion_changed.connect(self.set_excluded)
         self.results_tab.export_requested.connect(self.export_calibration)
         self.results_tab.table.sample_selected.connect(self._show_sample_image)
@@ -181,12 +204,67 @@ class MainWindow(QMainWindow):
 
     # -- config ------------------------------------------------------------
     def apply_config(self, cfg: CalibConfig) -> None:
+        old = self.session.config
         self.session.config = cfg
-        self._dirty = True
         if self.ros is not None:
             self.ros.apply_config(cfg)
-        self.log_message("Configuration updated")
+        if old.calibration_type != cfg.calibration_type and self.report is not None:
+            # The result of the other calibration type means something else.
+            self.report = None
+            self.session.results = None
+            self.results_tab.show_report(self.session.samples, None, cfg.max_reprojection_error)
+            self.results_tab.set_status("calibration type changed: press Compute")
+        self._mark_dirty()
+        self.log_message(f"Configuration updated ({cfg.calibration_type.replace('_', '-')})")
         self._refresh_samples()
+        self._update_motion_enabled()
+
+    def _on_config_pending(self, pending: bool) -> None:
+        self.tabs.setTabText(CONFIG_TAB, "Configuration *" if pending else "Configuration")
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Leaving the Configuration tab with changes not applied: ask what to do."""
+        previous, self._current_tab = self._current_tab, index
+        if self._switching_tab or previous != CONFIG_TAB or index == CONFIG_TAB:
+            return
+        if not self.config_tab.has_pending_changes():
+            return
+        box = QMessageBox(QMessageBox.Warning, "Configuration not applied",
+                          "Some configuration changes have not been applied yet, so they are "
+                          "not used.", parent=self)
+        apply_btn = box.addButton("Apply", QMessageBox.AcceptRole)
+        discard_btn = box.addButton("Discard changes", QMessageBox.DestructiveRole)
+        box.addButton("Stay in Configuration", QMessageBox.RejectRole)
+        box.setDefaultButton(apply_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is apply_btn and self.config_tab.apply():
+            return
+        if clicked is discard_btn:
+            self.config_tab.discard_changes()
+            return
+        self._switching_tab = True
+        self.tabs.setCurrentIndex(CONFIG_TAB)
+        self._current_tab = CONFIG_TAB
+        self._switching_tab = False
+
+    # -- ROS names -----------------------------------------------------------
+    def refresh_graph(self) -> None:
+        if self.ros is None:
+            return
+        self.config_tab.set_graph(self.ros.graph_snapshot())
+        self._update_motion_enabled()
+
+    def _update_motion_enabled(self) -> None:
+        """Plan/Execute need valid MoveIt names in the applied configuration."""
+        if self.ros is None:
+            return
+        cfg = self.session.config
+        fields = list(MOTION_FIELDS) + (["ik_service"] if cfg.max_joint_step > 0 else [])
+        statuses = self.config_tab.check_config(cfg)
+        bad = [f"{CalibConfig.__dataclass_fields__[f].metadata['label']} {getattr(cfg, f)!r}: "
+               f"{statuses[f][1]}" for f in fields if statuses[f][0] == ERROR]
+        self.acq_tab.set_motion_enabled(not bad, "; ".join(bad))
 
     # -- samples -----------------------------------------------------------
     def take_sample(self, forced: bool) -> None:
@@ -195,7 +273,7 @@ class MainWindow(QMainWindow):
     def _on_sample_ready(self, sample, image, decorated, meta) -> None:
         self.session.add_sample(sample, image, decorated)
         self.session.metadata.update(meta)
-        self._dirty = True
+        self._mark_dirty()
         self.log_message(f"Sample {sample.index} taken"
                          + (" (forced, pose not stable)" if sample.forced else "")
                          + f": reproj {sample.reprojection_error_mean:.2f} px, "
@@ -209,14 +287,14 @@ class MainWindow(QMainWindow):
         if idx is None:
             idx = self.session.samples[-1].index
         self.session.remove_sample(idx)
-        self._dirty = True
+        self._mark_dirty()
         self.log_message(f"Sample {idx} removed")
         self.report = None
         self._refresh_samples()
 
     def set_excluded(self, index: int, value: bool) -> None:
         self.session.set_excluded(index, value)
-        self._dirty = True
+        self._mark_dirty()
         self._refresh_samples(table=False)
         if len(self.session.active_samples()) >= 3:
             self.compute()
@@ -258,8 +336,11 @@ class MainWindow(QMainWindow):
         samples = self.session.active_samples()
         if not samples:
             raise RuntimeError("take at least one sample first")
-        X = flange_camera_guess(self.session.config, self.report.result.T if self.report else None)
-        return target_in_base_guess(samples, X), X, BoardModel(self.session.config).center
+        cfg = self.session.config
+        mode = cfg.calibration_type
+        result = self.report.result.T if self.report and self.report.mode == mode else None
+        X = hand_eye_guess(cfg, result)
+        return fixed_target_guess(samples, X, mode), X, BoardModel(cfg).center
 
     def random_pose(self) -> None:
         try:
@@ -268,7 +349,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Random pose", str(exc))
             return
         T_tc = random_camera_pose(self._rng, center, self.session.config)
-        T_bf = flange_goal(T_bt, T_tc, X)
+        T_bf = flange_goal(T_bt, T_tc, X, self.session.config.calibration_type)
         self.log_message("Planning to random pose " +
                          " ".join(f"{v:.3f}" for v in matrix_to_pose7(T_bf)))
         self._ros_call("plan_pose", T_bf, self.acq_tab.velocity(), self.acq_tab.acceleration())
@@ -284,7 +365,8 @@ class MainWindow(QMainWindow):
         poses = fibonacci_hemisphere(cfg.hemisphere_n, cfg.hemisphere_distance,
                                      cfg.hemisphere_max_polar, center,
                                      alternate_roll_deg=0.5 * (cfg.random_roll_max - cfg.random_roll_min))
-        cands = [Candidate(pose=flange_goal(T_bt, T, X), label=f"hemisphere {i}")
+        cands = [Candidate(pose=flange_goal(T_bt, T, X, cfg.calibration_type),
+                           label=f"hemisphere {i}")
                  for i, T in enumerate(poses)]
         self._ros_call("set_candidates", cands)
 
@@ -325,7 +407,8 @@ class MainWindow(QMainWindow):
                       seed=self.acq_tab.seed.value(), bootstrap_n=self.acq_tab.bootstrap_rounds(),
                       n_sigma=cfg.outlier_sigma,
                       T_optical_camera=pose7_to_matrix(T_oc) if T_oc else None,
-                      distance_range=(cfg.random_z_min, cfg.random_z_max))
+                      distance_range=(cfg.random_z_min, cfg.random_z_max),
+                      mode=cfg.calibration_type)
         self._worker = ComputeWorker(copy.deepcopy(self.session.samples), kwargs, self)
         self._worker.done.connect(self._on_computed)
         self._worker.failed.connect(self._on_compute_failed)
@@ -337,7 +420,7 @@ class MainWindow(QMainWindow):
     def _on_computed(self, report: Report) -> None:
         self.report = report
         self.session.results = report.to_dict()
-        self._dirty = True
+        self._mark_dirty()
         self.results_tab.show_report(self.session.samples, report,
                                      self.session.config.max_reprojection_error)
         v = report.valid_stats or report.ident_stats
@@ -362,15 +445,16 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export", "Compute a calibration first.")
             return
         cfg = self.session.config
-        if self.report.T_flange_camera_frame is not None:
-            child, T = cfg.camera_frame, self.report.T_flange_camera_frame
+        parent = cfg.flange_frame if result_parent(self.report.mode) == "flange" else cfg.base_frame
+        if self.report.T_camera_frame is not None:
+            child, T = cfg.camera_frame, self.report.T_camera_frame
         else:
             child, T = self.session.metadata.get("image_frame", "camera_optical_frame"), self.report.result.T
         path, _ = QFileDialog.getSaveFileName(self, "Export calibration", "handeye_calibration.launch.py",
                                               "Launch file (*.py);;YAML (*.yaml)")
         if path:
-            write_calibration(path, cfg.flange_frame, child, matrix_to_pose7(T))
-            self.log_message(f"Calibration {cfg.flange_frame} -> {child} written to {path}")
+            write_calibration(path, parent, child, matrix_to_pose7(T), self.report.mode)
+            self.log_message(f"Calibration {parent} -> {child} written to {path}")
 
     # -- session -----------------------------------------------------------
     def _confirm_discard(self) -> bool:
@@ -385,6 +469,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _set_session(self, session: Session) -> None:
+        self.autosaver.discard(self.session)    # the user saved or discarded it
         self.session = session
         self.report = None
         self._dirty = False
@@ -393,6 +478,8 @@ class MainWindow(QMainWindow):
             self.ros.apply_config(session.config)
         self.results_tab.show_report(session.samples, None, session.config.max_reprojection_error)
         self._refresh_samples()
+        self._update_motion_enabled()
+        self.autosaver.claim(session)
 
     def new_session(self) -> None:
         if self._confirm_discard():
@@ -431,9 +518,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save session", str(exc))
             return False
         self._dirty = False
+        self.autosaver.discard(None)            # the user folder is up to date now
         self._update_title()
         self.log_message(f"Session saved to {folder}")
         return True
+
+    def _mark_dirty(self) -> None:
+        """Something changed: remember it and write the autosave."""
+        self._dirty = True
+        try:
+            self.autosaver.save(self.session)
+        except OSError as exc:
+            self.log_error(f"autosave failed: {exc}")
+        self._update_title()
 
     def _update_title(self) -> None:
         name = "unsaved session" if self.session.is_temporary else str(self.session.folder)
@@ -447,7 +544,40 @@ class MainWindow(QMainWindow):
             self._worker.wait(10000)
         if self.ros is not None:
             self.ros.stop()
+        self.autosaver.discard(self.session)    # clean exit: no crash to recover from
         event.accept()
+
+
+def ask_restore() -> Optional[Session]:
+    """Offer to restore the newest autosave left by a GUI that did not exit cleanly."""
+    try:
+        orphans = autosave.find_orphans()
+    except OSError:
+        return None
+    if not orphans:
+        return None
+    newest = orphans[0]
+    others = len(orphans) - 1
+    box = QMessageBox(QMessageBox.Question, "Restore session",
+                      "The calibration GUI did not exit cleanly. An autosaved session "
+                      f"was found:\n\n{newest.describe()}\n\nRestore it?")
+    box.setInformativeText(f"Folder: {newest.folder}" +
+                           (f"\n{others} older autosave(s) are kept in {newest.folder.parent}."
+                            if others else ""))
+    restore_btn = box.addButton("Restore", QMessageBox.AcceptRole)
+    delete_btn = box.addButton("Delete it", QMessageBox.DestructiveRole)
+    box.addButton("Not now", QMessageBox.RejectRole)
+    box.setDefaultButton(restore_btn)
+    box.exec()
+    if box.clickedButton() is restore_btn:
+        try:
+            return autosave.restore(newest)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(None, "Restore session", f"Cannot restore: {exc}")
+            return None
+    if box.clickedButton() is delete_btn:
+        autosave.discard(newest)
+    return None
 
 
 def main(argv=None) -> int:
@@ -464,17 +594,22 @@ def main(argv=None) -> int:
                         help="do not start ROS (review and recompute saved sessions)")
     args, _ = parser.parse_known_args(user_args[1:])
 
-    if args.session:
-        session = Session.load(args.session)
-    else:
-        session = Session(CalibConfig.load(args.config) if args.config else CalibConfig())
-    if args.config and args.session:
-        session.config = CalibConfig.load(args.config)
-
     signal.signal(signal.SIGINT, signal.SIG_DFL)   # Ctrl+C closes the application
     app = QApplication(user_args)
     app.setApplicationName("handeye_gui")
-    window = MainWindow(session, use_ros=not args.offline, ros_args=argv)
+
+    session, restored = None, False
+    if not args.session:
+        session = ask_restore()
+        restored = session is not None
+    if session is None:
+        if args.session:
+            session = Session.load(args.session)
+        else:
+            session = Session(CalibConfig.load(args.config) if args.config else CalibConfig())
+        if args.config and args.session:
+            session.config = CalibConfig.load(args.config)
+    window = MainWindow(session, use_ros=not args.offline, ros_args=argv, restored=restored)
     window.show()
     if args.session and len(session.active_samples()) >= 3:
         QTimer.singleShot(0, window.compute)

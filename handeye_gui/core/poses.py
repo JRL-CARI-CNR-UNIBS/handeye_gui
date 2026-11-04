@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Candidate camera poses around the target (random and Fibonacci hemisphere).
 
+Poses are generated as the camera pose relative to the target
+(T_target_camera); ``flange_goal`` turns them into a flange goal for either
+calibration type.
+
 Target frame (OpenCV board convention): X right, Y down, Z into the board.
 A camera looking at the board frontally has the same axes as the target and
 sits on the -Z side. All camera poses keep the target centre on the optical
@@ -19,6 +23,7 @@ from .config import CalibConfig
 from .geometry import invert, pose7_to_matrix
 from .evaluation import estimate_target_pose
 from .sample import Sample
+from .solvers import EYE_IN_HAND, EYE_TO_HAND, check_mode
 
 GOLDEN_ANGLE = np.pi * (3.0 - np.sqrt(5.0))
 
@@ -96,19 +101,43 @@ def fibonacci_hemisphere(n: int, distance: float, max_polar_deg: float,
     return poses
 
 
-def flange_goal(T_base_target: np.ndarray, T_target_camera: np.ndarray,
-                T_flange_camera: np.ndarray) -> np.ndarray:
-    """Flange pose in the base frame that puts the camera at ``T_target_camera``."""
-    return T_base_target @ T_target_camera @ invert(T_flange_camera)
+def flange_goal(T_fixed_target: np.ndarray, T_target_camera: np.ndarray,
+                X: np.ndarray, mode: str = EYE_IN_HAND) -> np.ndarray:
+    """Flange pose in the base frame that puts the camera at ``T_target_camera``.
+
+    Eye-in-hand: ``T_fixed_target`` is the target in base and ``X`` is
+    T_flange_camera; the camera moves around the fixed target.
+    Eye-to-hand: ``T_fixed_target`` is the target in the flange frame and
+    ``X`` is T_base_camera; the target moves in front of the fixed camera so
+    that their relative pose is the same.
+    """
+    if check_mode(mode) == EYE_IN_HAND:
+        return T_fixed_target @ T_target_camera @ invert(X)
+    return X @ invert(T_target_camera) @ invert(T_fixed_target)
 
 
-def flange_camera_guess(config: CalibConfig, result_T: np.ndarray | None = None) -> np.ndarray:
-    """Current best flange -> optical transform: the calibration if any, else the config guess."""
+def hand_eye_guess(config: CalibConfig, result_T: np.ndarray | None = None) -> np.ndarray:
+    """Current best hand-eye transform: the calibration if any, else the config guess.
+
+    The guess is ``initial_flange_to_camera`` for eye-in-hand and
+    ``initial_base_to_camera`` for eye-to-hand.
+    """
     if result_T is not None:
         return np.asarray(result_T)
+    if config.calibration_type == EYE_TO_HAND:
+        return pose7_to_matrix(config.initial_base_to_camera)
     return pose7_to_matrix(config.initial_flange_to_camera)
 
 
+def fixed_target_guess(samples: Sequence[Sample], X: np.ndarray,
+                       mode: str = EYE_IN_HAND) -> np.ndarray:
+    """Target pose in its fixed frame (base or flange) from the samples and X."""
+    return estimate_target_pose(samples, X, mode)
+
+
+# Backward-compatible names (eye-in-hand).
+flange_camera_guess = hand_eye_guess
+
+
 def target_in_base_guess(samples: Sequence[Sample], T_flange_camera: np.ndarray) -> np.ndarray:
-    """Target pose in base from the acquired samples and a flange -> camera transform."""
-    return estimate_target_pose(samples, T_flange_camera)
+    return fixed_target_guess(samples, T_flange_camera, EYE_IN_HAND)

@@ -48,9 +48,36 @@ In **Configuration**:
 | Image / camera info / depth topics | `/camera/camera/color/image_raw`, `.../color/camera_info`, `.../aligned_depth_to_color/image_raw` |
 | Planning group | `ur_manipulator` |
 | Initial flange->camera guess | rough mounting offset, e.g. `0 0.05 0.05 0 0 0 1` |
+| Max joint motion per pose | 90 deg (0 = let MoveIt choose the IK solution) |
+
+Topic, frame, planning-group and action fields are drop-downs filled from the
+running system (refreshed every few seconds, or with **Refresh ROS names**).
+Choosing the image topic from the list also fills the camera info topic. Names
+that do not exist are shown in red, with the reason in the tooltip; while the
+MoveIt names are wrong, Plan and Execute stay disabled.
+
+Press **View target...** to see the grid described by the Target fields, with
+the id written on every marker: compare it with the printed sheet. **Export for
+printing...** writes it at real size (PDF/SVG/PNG, on an A4/A3 page when it
+fits); print at 100 %, without "fit to page", and measure the board width.
 
 Press **Apply**, then **Save config...** to reuse it next time
-(`--config my.yaml`).
+(`--config my.yaml`). Until you press Apply the edits are not used: the tab
+title gets a `*`, the Apply button turns orange, and leaving the tab asks
+whether to apply them, discard them or stay.
+
+### Eye-to-hand
+
+Set **Calibration type** to `eye_to_hand` when the camera is fixed in the cell
+and the target is mounted on the flange. Then:
+
+- give a rough **Initial base->camera guess** (optical frame in the base frame)
+  instead of the flange->camera one;
+- hemisphere and random poses move the target in front of the camera with the
+  same relative views as in eye-in-hand;
+- the result is base -> optical (and base -> `camera_frame`), the scatter plots
+  show the target position in the flange frame, and the exported launch file
+  publishes `base_frame -> camera_frame`.
 
 ![Configuration tab](images/config_tab.png)
 
@@ -91,7 +118,14 @@ After the first sample, the robot can move by itself:
   the configured bounds, keeping the target centre on the optical axis.
 
 These poses use the current calibration if one was computed, else the initial
-guess, so the first few may frame the target off-centre. Compute after 3-4
+guess, so the first few may frame the target off-centre.
+
+Pose goals are converted to joints with MoveIt IK (`/compute_ik`), seeded with
+the current configuration. A solution where some joint moves more than **Max
+joint motion per pose** is rejected (whole turns of joints with a +/-360 deg
+range are removed first) and new seeds around the current configuration are
+tried, up to **IK attempts**; the log then says which joint was closest to the
+limit. The plan message reports the largest joint motion of the chosen solution. Compute after 3-4
 samples and later poses improve. Always watch the robot: velocity and
 acceleration scaling default to 0.1, and **Stop** cancels the motion.
 
@@ -133,6 +167,10 @@ data, the kind of systematic error this check is meant to reveal.
 
 ## 6. Save and export
 
+The session is autosaved after every change (see the README), so a crash loses
+nothing; still save it to a folder of your own.
+
+
 - **Save samples...** (or `Ctrl+S`) writes the session folder.
 - **Save joints...** stores the sample configurations to replay the same poses
   later with **Load joints...** (moveit_calibration format).
@@ -159,4 +197,7 @@ best one to `results.yaml`.
 | Take sample always red, "moving" | thresholds too tight for the camera noise: raise them a little |
 | Depth line missing | depth topic, `align_depth.enable:=true`, same resolution as colour |
 | "planning failed" | pose unreachable or in collision: try another candidate |
+| "no IK solution within ... deg" | pose far from the current configuration: raise the limit, or go there in two steps |
+| Plan/Execute disabled | MoveIt action names (red in Configuration), move_group not running |
+| "Restore session" at start | the previous run did not exit cleanly: restore the autosave, then save it |
 | Large constant depth dZ | marker size measured wrong |

@@ -54,12 +54,12 @@ def main(argv=None) -> int:
     methods = list(Method) if args.method.lower() == "all" else [Method.parse(args.method)]
 
     print(f"Session {args.folder}: {len(session.samples)} samples, "
-          f"{len(session.active_samples())} used")
+          f"{len(session.active_samples())} used, {session.config.calibration_type}")
     reports = {}
     for m in methods:
         try:
             rep = evaluate(session.samples, m, args.ratio, args.seed, args.bootstrap, n_sigma,
-                           T_oc, distance_range)
+                           T_oc, distance_range, mode=session.config.calibration_type)
         except (ValueError, RuntimeError) as exc:
             print(f"\n== {m.name}: failed: {exc}")
             continue

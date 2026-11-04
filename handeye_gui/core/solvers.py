@@ -1,6 +1,17 @@
 # Copyright 2026 Manuel Beschi
 # SPDX-License-Identifier: Apache-2.0
-"""Thin wrapper around ``cv2.calibrateHandEye`` (eye-in-hand)."""
+"""Thin wrapper around ``cv2.calibrateHandEye``, eye-in-hand and eye-to-hand.
+
+Both modes use the same solver. Only the robot pose fed to it changes:
+
+* eye-in-hand (camera on the flange): ``A_i = T_base_flange``, the result is
+  ``T_flange_optical`` and the target is fixed in the base frame;
+* eye-to-hand (camera fixed, target on the flange): ``A_i = T_flange_base``,
+  the result is ``T_base_optical`` and the target is fixed in the flange frame.
+
+In both cases ``A_i @ X @ T_camera_target_i`` is constant: the target pose in
+its fixed frame.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +22,7 @@ from typing import Any, Dict, Sequence
 import cv2
 import numpy as np
 
-from .geometry import matrix_to_pose
+from .geometry import invert, matrix_to_pose
 from .sample import Sample
 
 
@@ -33,14 +44,42 @@ class Method(Enum):
 
 MIN_SAMPLES = 3
 
+EYE_IN_HAND = "eye_in_hand"
+EYE_TO_HAND = "eye_to_hand"
+MODES = (EYE_IN_HAND, EYE_TO_HAND)
+
+
+def check_mode(mode: str) -> str:
+    if mode not in MODES:
+        raise ValueError(f"unknown calibration type {mode!r}, expected one of {MODES}")
+    return mode
+
+
+def result_parent(mode: str) -> str:
+    """Name of the frame the hand-eye result is expressed in ("flange" or "base")."""
+    return "flange" if check_mode(mode) == EYE_IN_HAND else "base"
+
+
+def target_parent(mode: str) -> str:
+    """Name of the frame the target is fixed to ("base" or "flange")."""
+    return "base" if check_mode(mode) == EYE_IN_HAND else "flange"
+
+
+def robot_pose(sample: Sample, mode: str = EYE_IN_HAND) -> np.ndarray:
+    """Robot transform that enters the chain: T_base_flange, or its inverse for eye-to-hand."""
+    T = sample.T_base_flange
+    return T if check_mode(mode) == EYE_IN_HAND else invert(T)
+
 
 @dataclass
 class HandEyeResult:
-    """Calibration result. ``T`` is the camera (optical) pose in the flange frame."""
+    """Calibration result. ``T`` is the camera (optical) pose in the flange frame
+    (eye-in-hand) or in the base frame (eye-to-hand)."""
 
     T: np.ndarray
     method: Method
     n_samples: int
+    mode: str = EYE_IN_HAND
 
     @property
     def translation(self) -> list:
@@ -51,14 +90,18 @@ class HandEyeResult:
         return matrix_to_pose(self.T)[1]
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"method": self.method.name, "n_samples": self.n_samples,
+        return {"method": self.method.name, "mode": self.mode, "n_samples": self.n_samples,
                 "translation": self.translation, "quaternion_xyzw": self.quaternion,
                 "matrix": self.T.tolist()}
 
 
 def solve_matrices(T_base_flange: Sequence[np.ndarray], T_camera_target: Sequence[np.ndarray],
                    method: Method | str = Method.TSAI) -> np.ndarray:
-    """Solve AX = XB from paired transforms; returns T_flange_camera (4x4)."""
+    """Solve AX = XB from paired transforms; returns T_flange_camera (4x4).
+
+    For eye-to-hand pass the inverted robot poses (T_flange_base): the result
+    is then T_base_camera.
+    """
     method = Method.parse(method)
     if len(T_base_flange) != len(T_camera_target):
         raise ValueError("pose lists have different lengths")
@@ -77,9 +120,10 @@ def solve_matrices(T_base_flange: Sequence[np.ndarray], T_camera_target: Sequenc
     return X
 
 
-def solve(samples: Sequence[Sample], method: Method | str = Method.TSAI) -> HandEyeResult:
+def solve(samples: Sequence[Sample], method: Method | str = Method.TSAI,
+          mode: str = EYE_IN_HAND) -> HandEyeResult:
     """Calibrate from samples (the caller decides which samples to pass)."""
     method = Method.parse(method)
-    X = solve_matrices([s.T_base_flange for s in samples],
+    X = solve_matrices([robot_pose(s, mode) for s in samples],
                        [s.T_camera_target for s in samples], method)
-    return HandEyeResult(T=X, method=method, n_samples=len(samples))
+    return HandEyeResult(T=X, method=method, n_samples=len(samples), mode=mode)

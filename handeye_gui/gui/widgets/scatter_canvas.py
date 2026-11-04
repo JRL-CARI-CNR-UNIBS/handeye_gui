@@ -11,6 +11,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from ...core.evaluation import Report
+from ...core.solvers import target_parent
 
 STYLE = {
     "ident": dict(marker="o", color="tab:blue", label="identification"),
@@ -21,7 +22,11 @@ STYLE = {
 
 
 class ScatterCanvas(FigureCanvasQTAgg):
-    """Target position in base (mm, relative to the identification mean) on XY, XZ, YZ."""
+    """Target position (mm, relative to the identification mean) on XY, XZ, YZ.
+
+    The target is expressed in its fixed frame: base (eye-in-hand) or flange
+    (eye-to-hand).
+    """
 
     def __init__(self, parent=None):
         self.figure = Figure(figsize=(9, 3), tight_layout=True)
@@ -30,7 +35,9 @@ class ScatterCanvas(FigureCanvasQTAgg):
         self.axes = self.figure.subplots(1, 3)
         self.clear()
 
-    def clear(self) -> None:
+    def clear(self, frame: str = "") -> None:
+        self.figure.suptitle(f"Target position in the {frame} frame, relative to the mean"
+                             if frame else "", fontsize=9)
         for ax, (a, b) in zip(self.axes, ("XY", "XZ", "YZ")):
             ax.clear()
             ax.set_xlabel(f"{a} [mm]")
@@ -40,9 +47,10 @@ class ScatterCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
     def plot(self, report: Optional[Report]) -> None:
-        self.clear()
         if report is None:
+            self.clear()
             return
+        self.clear(target_parent(report.mode))
         ref = report.reference[:3, 3]
         groups = {k: [] for k in STYLE}
         outliers, excluded = set(report.outliers), set(report.excluded_indices)

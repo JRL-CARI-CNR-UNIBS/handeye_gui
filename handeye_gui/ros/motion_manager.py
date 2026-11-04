@@ -5,19 +5,29 @@
 Planning uses ``MoveGroup`` with ``plan_only = True``; execution sends the
 stored trajectory to ``ExecuteTrajectory``. Both are asynchronous: results
 come back through the ``on_done(kind, ok, message)`` callback.
+
+Pose goals: when ``max_joint_step > 0`` the pose is first converted to joints
+with the ``GetPositionIK`` service (``/compute_ik``, any IK plugin), choosing
+a solution close to the current configuration (see ``core.ik_search``); the
+planner then gets a joint goal. With ``max_joint_step = 0`` the pose goes to
+move_group as position/orientation constraints, and MoveIt picks the IK
+solution.
 """
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
 
 import numpy as np
-from geometry_msgs.msg import Pose
+from builtin_interfaces.msg import Duration as DurationMsg
+from geometry_msgs.msg import Pose, PoseStamped
 from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (Constraints, JointConstraint, MotionPlanRequest, MoveItErrorCodes,
                              OrientationConstraint, PositionConstraint)
+from moveit_msgs.srv import GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
@@ -26,10 +36,13 @@ from shape_msgs.msg import SolidPrimitive
 
 from ..core.config import CalibConfig
 from ..core.geometry import matrix_to_pose
+from ..core.ik_search import IkSearch
+from .robot_description import RobotDescription
 
 JOINT_TOLERANCE = 1e-3       # rad
 POSITION_TOLERANCE = 1e-3    # m, radius of the goal sphere
 ORIENTATION_TOLERANCE = 5e-3  # rad per axis
+IK_TIMEOUT = 0.1             # s, per IK call
 
 _ERROR_NAMES = {v: k for k, v in vars(MoveItErrorCodes).items()
                 if k.isupper() and isinstance(v, int)}
@@ -58,15 +71,20 @@ class MotionManager:
 
     def __init__(self, node: Node, config: CalibConfig,
                  on_done: Callable[[str, bool, str], None],
-                 guard: Callable[[Callable], Callable]):
+                 guard: Callable[[Callable], Callable],
+                 on_error: Callable[[str], None] = lambda msg: None):
         self._node = node
         self._on_done = on_done
         self._guard = guard
         self._lock = threading.Lock()
         self._group = ReentrantCallbackGroup()
         self.config = config
+        self.robot = RobotDescription(node, config.robot_description_topic, guard, on_error)
         self._move_client: Optional[ActionClient] = None
         self._exec_client: Optional[ActionClient] = None
+        self._ik_client = None
+        self._ik_job: Optional["_IkJob"] = None
+        self._plan_note = ""
         self._joint_sub = None
         self._joints: dict = {}       # name -> latest position
         self._trajectory = None
@@ -76,16 +94,23 @@ class MotionManager:
         self.configure(config)
 
     def configure(self, config: CalibConfig) -> None:
+        self.robot.configure(config.robot_description_topic)
         with self._lock:
             old = (self.config.move_group_action, self.config.execute_action,
-                   self.config.joint_states_topic)
-            new = (config.move_group_action, config.execute_action, config.joint_states_topic)
+                   self.config.joint_states_topic, self.config.ik_service)
+            new = (config.move_group_action, config.execute_action, config.joint_states_topic,
+                   config.ik_service)
             self.config = config
             if self._move_client is not None and old == new:
                 return
             for client in (self._move_client, self._exec_client):
                 if client is not None:
                     client.destroy()
+            if self._ik_client is not None:
+                self._node.destroy_client(self._ik_client)
+            self._ik_job = None
+            self._ik_client = self._node.create_client(GetPositionIK, config.ik_service,
+                                                       callback_group=self._group)
             if self._joint_sub is not None:
                 self._node.destroy_subscription(self._joint_sub)
             self._move_client = ActionClient(self._node, MoveGroup, config.move_group_action,
@@ -148,8 +173,11 @@ class MotionManager:
         req.start_state.is_diff = True
         return req
 
-    def plan(self, target_joints: dict, vel: float, acc: float, auto_execute: bool = False) -> None:
+    def plan(self, target_joints: dict, vel: float, acc: float, auto_execute: bool = False,
+             keep_note: bool = False) -> None:
         """Plan to a joint configuration {name: value}."""
+        if not keep_note:
+            self._plan_note = ""
         req = self._request(vel, acc)
         c = Constraints()
         for name, value in target_joints.items():
@@ -159,9 +187,91 @@ class MotionManager:
         req.goal_constraints = [c]
         self._send_plan(req, auto_execute)
 
+    def group_joints(self) -> List[str]:
+        """Joints of the planning group: from the SRDF, else the configured ones, else all."""
+        model = self.robot.model()
+        if model is not None and model.groups and self.config.planning_group in model.groups:
+            return list(model.groups[self.config.planning_group])
+        return self.current_joints()[0]
+
     def plan_pose(self, T_base_flange: np.ndarray, vel: float, acc: float,
                   auto_execute: bool = False) -> None:
         """Plan to a flange pose expressed in the base frame."""
+        if self.config.max_joint_step > 0:
+            self._plan_pose_ik(T_base_flange, vel, acc, auto_execute)
+        else:
+            self._plan_pose_constraints(T_base_flange, vel, acc, auto_execute)
+
+    # -- pose goals through IK ---------------------------------------------
+    def _plan_pose_ik(self, T_base_flange: np.ndarray, vel: float, acc: float,
+                      auto_execute: bool) -> None:
+        cfg = self.config
+        if not self._ik_client.service_is_ready():
+            raise RuntimeError(f"IK service {cfg.ik_service} not available "
+                               "(set 'Max joint motion per pose' to 0 to plan without it)")
+        joints = self.group_joints()
+        if not joints:
+            raise RuntimeError(f"no joint states received on {cfg.joint_states_topic}")
+        model = self.robot.model()
+        limits = {j: model.limits(j) for j in joints} if model is not None else {}
+        search = IkSearch(dict(self._joints), joints, math.radians(cfg.max_joint_step),
+                          cfg.ik_attempts, limits,
+                          model.is_angular if model is not None else None)
+        job = _IkJob(search, T_base_flange, vel, acc, auto_execute)
+        self._trajectory = None
+        self._ik_job = job
+        self._ik_next(job)
+
+    def _ik_request(self, job: "_IkJob", seed: dict) -> GetPositionIK.Request:
+        cfg = self.config
+        req = GetPositionIK.Request()
+        ik = req.ik_request
+        ik.group_name = cfg.planning_group
+        ik.ik_link_name = cfg.flange_frame
+        ik.avoid_collisions = True
+        ik.robot_state.is_diff = True
+        ik.robot_state.joint_state.name = list(seed)
+        ik.robot_state.joint_state.position = [float(v) for v in seed.values()]
+        t, q = matrix_to_pose(job.pose)
+        ps = PoseStamped()
+        ps.header.frame_id = cfg.base_frame
+        ps.pose.position.x, ps.pose.position.y, ps.pose.position.z = t
+        ps.pose.orientation.x, ps.pose.orientation.y, ps.pose.orientation.z, \
+            ps.pose.orientation.w = q
+        ik.pose_stamped = ps
+        ik.timeout = DurationMsg(sec=0, nanosec=int(IK_TIMEOUT * 1e9))
+        return req
+
+    def _ik_next(self, job: "_IkJob") -> None:
+        if job is not self._ik_job:
+            return                       # cancelled or superseded
+        seed = job.search.next_seed()
+        if seed is None:
+            self._ik_job = None
+            self._on_done("plan", False, job.search.failure_message())
+            return
+        future = self._ik_client.call_async(self._ik_request(job, seed))
+        future.add_done_callback(self._guard(lambda f: self._on_ik(job, f)))
+
+    def _on_ik(self, job: "_IkJob", future) -> None:
+        if job is not self._ik_job:
+            return
+        res = future.result()
+        if res is not None and res.error_code.val == MoveItErrorCodes.SUCCESS:
+            js = res.solution.joint_state
+            q = job.search.evaluate(dict(zip(js.name, js.position)))
+            if q is not None:
+                self._ik_job = None
+                step, joint = job.search.step(q)
+                self._plan_note = (f"IK attempt {job.search.tried}, largest joint motion "
+                                   f"{math.degrees(step):.1f} deg ({joint})")
+                self.plan(q, job.vel, job.acc, job.auto_execute, keep_note=True)
+                return
+        self._ik_next(job)
+
+    # -- pose goals as constraints -----------------------------------------
+    def _plan_pose_constraints(self, T_base_flange: np.ndarray, vel: float, acc: float,
+                               auto_execute: bool) -> None:
         cfg = self.config
         t, q = matrix_to_pose(T_base_flange)
         req = self._request(vel, acc)
@@ -221,7 +331,8 @@ class MotionManager:
         self._trajectory = result.planned_trajectory
         n = len(self._trajectory.joint_trajectory.points)
         label = f" (candidate {self.current + 1}/{len(self.candidates)})" if self.current >= 0 else ""
-        self._on_done("plan", True, f"plan ready, {n} points{label}")
+        note = f"; {self._plan_note}" if self._plan_note else ""
+        self._on_done("plan", True, f"plan ready, {n} points{label}{note}")
         if auto_execute:
             self.execute()
 
@@ -256,7 +367,19 @@ class MotionManager:
         self._on_done("execute", ok, "motion done" if ok else f"execution failed: {error_name(code)}")
 
     def stop(self) -> None:
-        """Cancel the running planning or execution goal."""
+        """Cancel the IK search and the running planning or execution goal."""
+        if self._ik_job is not None:
+            self._ik_job = None
+            self._on_done("plan", False, "IK search cancelled")
         handle = self._goal_handle
         if handle is not None:
             handle.cancel_goal_async()
+
+
+@dataclass
+class _IkJob:
+    search: IkSearch
+    pose: np.ndarray
+    vel: float
+    acc: float
+    auto_execute: bool

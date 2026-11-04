@@ -12,6 +12,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+CALIBRATION_TYPES = ["eye_in_hand", "eye_to_hand"]
+
 ARUCO_DICTIONARIES = [
     "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
     "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
@@ -23,7 +25,13 @@ ARUCO_DICTIONARIES = [
 
 
 def _f(default: Any, group: str, label: str, help: str = "", **extra: Any):
-    """Dataclass field with GUI metadata (group, label, tooltip, ranges, choices)."""
+    """Dataclass field with GUI metadata (group, label, tooltip, ranges, choices).
+
+    ``suggest`` names the kind of ROS entity the field refers to; the GUI then
+    offers the existing ones in a drop-down and checks that the name exists:
+    ``image_topic``, ``camera_info_topic``, ``depth_topic``, ``joint_states_topic``,
+    ``frame``, ``planning_group``, ``action:<type>``, ``service:<type>``, ``topic:<type>``.
+    """
     meta = {"group": group, "label": label, "help": help}
     meta.update(extra)
     if isinstance(default, list):
@@ -34,6 +42,13 @@ def _f(default: Any, group: str, label: str, help: str = "", **extra: Any):
 @dataclass
 class CalibConfig:
     """All user-tunable settings. Lengths are in metres, angles in degrees."""
+
+    # --- Calibration --------------------------------------------------------
+    calibration_type: str = _f(
+        "eye_in_hand", "Calibration", "Calibration type",
+        "eye_in_hand: camera on the flange, target fixed in the cell.\n"
+        "eye_to_hand: camera fixed in the cell, target on the flange.",
+        choices=CALIBRATION_TYPES)
 
     # --- Target -------------------------------------------------------------
     aruco_dictionary: str = _f("DICT_4X4_50", "Target", "ArUco dictionary",
@@ -54,19 +69,27 @@ class CalibConfig:
                                "Enable for white-on-black markers (detectInvertedMarker).")
 
     # --- Frames -------------------------------------------------------------
-    base_frame: str = _f("base_link", "Frames", "Base frame")
-    flange_frame: str = _f("tool0", "Frames", "Flange frame")
+    base_frame: str = _f("base_link", "Frames", "Base frame", suggest="frame")
+    flange_frame: str = _f("tool0", "Frames", "Flange frame",
+                           "Robot flange. Eye-to-hand: the target is mounted on it.",
+                           suggest="frame")
     camera_frame: str = _f("camera_link", "Frames", "Camera frame",
                            "Frame to report the result in. The solver works in the image "
-                           "(optical) frame; the result is converted with TF if they differ.")
+                           "(optical) frame; the result is converted with TF if they differ.",
+                           suggest="frame")
 
     # --- Topics -------------------------------------------------------------
-    image_topic: str = _f("/camera/camera/color/image_raw", "Topics", "Image topic")
-    camera_info_topic: str = _f("/camera/camera/color/camera_info", "Topics", "Camera info topic")
+    image_topic: str = _f("/camera/camera/color/image_raw", "Topics", "Image topic",
+                          "Choosing a topic from the list also fills the camera info topic.",
+                          suggest="image_topic")
+    camera_info_topic: str = _f("/camera/camera/color/camera_info", "Topics", "Camera info topic",
+                                suggest="camera_info_topic")
     depth_topic: str = _f("/camera/camera/aligned_depth_to_color/image_raw", "Topics",
                           "Depth topic (optional)",
-                          "Depth aligned to the colour image. Empty = disabled.")
-    joint_states_topic: str = _f("/joint_states", "Topics", "Joint states topic")
+                          "Depth aligned to the colour image. Empty = disabled.",
+                          suggest="depth_topic")
+    joint_states_topic: str = _f("/joint_states", "Topics", "Joint states topic",
+                                 suggest="joint_states_topic")
 
     # --- Stability ----------------------------------------------------------
     stability_window: float = _f(0.5, "Stability", "Window [s]", min=0.05, max=10.0, decimals=2)
@@ -76,18 +99,41 @@ class CalibConfig:
                                         min=0.0, max=45.0, decimals=3)
 
     # --- Motion -------------------------------------------------------------
-    planning_group: str = _f("manipulator", "Motion", "Planning group")
-    move_group_action: str = _f("/move_action", "Motion", "MoveGroup action")
-    execute_action: str = _f("/execute_trajectory", "Motion", "ExecuteTrajectory action")
+    planning_group: str = _f("manipulator", "Motion", "Planning group",
+                             "MoveIt planning group (the list comes from the SRDF).",
+                             suggest="planning_group")
+    move_group_action: str = _f("/move_action", "Motion", "MoveGroup action",
+                                suggest="action:moveit_msgs/action/MoveGroup")
+    execute_action: str = _f("/execute_trajectory", "Motion", "ExecuteTrajectory action",
+                             suggest="action:moveit_msgs/action/ExecuteTrajectory")
     velocity_scaling: float = _f(0.1, "Motion", "Velocity scaling", min=0.01, max=1.0, decimals=2)
     acceleration_scaling: float = _f(0.1, "Motion", "Acceleration scaling",
                                      min=0.01, max=1.0, decimals=2)
     planning_time: float = _f(5.0, "Motion", "Planning time [s]", min=0.1, max=60.0, decimals=1)
     joint_names: List[str] = _f([], "Motion", "Joint names",
                                 "Comma separated. Empty = all joints in joint_states.")
+    max_joint_step: float = _f(
+        90.0, "Motion", "Max joint motion per pose [deg]",
+        "Pose goals are solved with MoveIt IK (/compute_ik) and rejected when a joint "
+        "would move more than this from the current configuration. Other seeds are "
+        "tried around the current configuration. 0 = disabled (MoveIt picks the IK "
+        "solution, which can be far away).", min=0.0, max=720.0, decimals=1)
+    ik_attempts: int = _f(30, "Motion", "IK attempts",
+                          "IK calls per pose goal (first seed: current configuration, then "
+                          "random seeds in a growing neighbourhood).", min=1, max=1000)
+    ik_service: str = _f("/compute_ik", "Motion", "IK service",
+                         suggest="service:moveit_msgs/srv/GetPositionIK")
+    robot_description_topic: str = _f(
+        "/robot_description", "Motion", "Robot description topic",
+        "URDF topic (joint limits). The SRDF is read from <topic>_semantic "
+        "(planning groups).", suggest="topic:std_msgs/msg/String")
     initial_flange_to_camera: List[float] = _f(
         [0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 1.0], "Motion", "Initial flange->camera guess",
-        "x y z qx qy qz qw of the optical frame in the flange frame. "
+        "Eye-in-hand: x y z qx qy qz qw of the optical frame in the flange frame. "
+        "Used to generate poses before a calibration exists.")
+    initial_base_to_camera: List[float] = _f(
+        [0.5, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0], "Motion", "Initial base->camera guess",
+        "Eye-to-hand: x y z qx qy qz qw of the optical frame in the base frame. "
         "Used to generate poses before a calibration exists.")
 
     # --- Pose generation ----------------------------------------------------
@@ -134,6 +180,10 @@ class CalibConfig:
         h = self.marker_height if self.marker_height > 0 else self.marker_size
         sy = self.marker_separation_y if self.marker_separation_y > 0 else self.marker_separation
         return w, h, self.marker_separation, sy
+
+    @property
+    def eye_to_hand(self) -> bool:
+        return self.calibration_type == "eye_to_hand"
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)

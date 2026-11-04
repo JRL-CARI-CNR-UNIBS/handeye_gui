@@ -69,6 +69,11 @@ class BoardModel:
         if not hasattr(cv2.aruco, config.aruco_dictionary):
             raise ValueError(f"unknown ArUco dictionary {config.aruco_dictionary}")
         self.dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, config.aruco_dictionary))
+        n_ids = self.dictionary.bytesList.shape[0]
+        last_id = config.first_marker_id + nx * ny - 1
+        if last_id >= n_ids:
+            raise ValueError(f"{config.aruco_dictionary} has ids 0..{n_ids - 1}, but the grid "
+                             f"needs ids {config.first_marker_id}..{last_id}")
         obj_points, ids = [], []
         for r in range(ny):
             for c in range(nx):

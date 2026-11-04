@@ -24,12 +24,15 @@ from typing import Callable, List, Optional, Sequence
 
 import numpy as np
 import rclpy
+import yaml
 from PySide6.QtCore import QThread, Signal, Slot
+from rclpy.action import get_action_server_names_and_types_by_node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.time import Time
 
 from ..core.config import CalibConfig
 from ..core.geometry import matrix_to_pose7
+from ..core.ros_names import GraphSnapshot
 from ..core.sample import Sample
 from .camera_manager import CameraManager
 from .motion_manager import Candidate, MotionManager
@@ -89,7 +92,8 @@ class RosThread(QThread):
             self.tf = TfManager(self.node, self._config, self.stability_changed.emit, self.guard)
             self.camera = CameraManager(self.node, self._config, self.image_ready.emit,
                                         self.tf.push_target, self.guard)
-            self.motion = MotionManager(self.node, self._config, self.motion_done.emit, self.guard)
+            self.motion = MotionManager(self.node, self._config, self.motion_done.emit, self.guard,
+                                        self.error.emit)
             executor = SingleThreadedExecutor()
             executor.add_node(self.node)
             self._executor = executor
@@ -213,6 +217,49 @@ class RosThread(QThread):
     def set_candidates(self, candidates: Sequence[Candidate]) -> None:
         self.motion.set_candidates(candidates)
         self.status.emit(f"{len(candidates)} candidate poses loaded")
+
+    def graph_snapshot(self) -> Optional[GraphSnapshot]:
+        """Topics, actions, services, TF frames and planning groups currently visible.
+
+        Called from the GUI thread: rclpy graph queries and the TF buffer are
+        safe to use while the executor spins in this thread.
+        """
+        node = self.node
+        if node is None or self.tf is None:
+            return None
+        try:
+            snap = GraphSnapshot()
+            # This node subscribes to the configured topics and creates the
+            # action/service clients, so they always appear in the graph:
+            # only publishers and servers of the other nodes count.
+            snap.topics = {n: list(t) for n, t in node.get_topic_names_and_types()}
+            snap.publishers = {name: node.count_publishers(name) for name in snap.topics}
+            me = (node.get_name(), node.get_namespace())
+            for name, ns in node.get_node_names_and_namespaces():
+                if (name, ns) == me:
+                    continue
+                try:
+                    servers = get_action_server_names_and_types_by_node(node, name, ns)
+                    services = node.get_service_names_and_types_by_node(name, ns)
+                except Exception:  # noqa: BLE001 - the node may have just gone away
+                    continue
+                for n, t in servers:
+                    snap.actions.setdefault(n, list(t))
+                for n, t in services:
+                    snap.services.setdefault(n, list(t))
+            frames = yaml.safe_load(self.tf.buffer.all_frames_as_yaml()) or {}
+            if isinstance(frames, dict) and frames:
+                names = set(frames)
+                names.update(v.get("parent") for v in frames.values()
+                             if isinstance(v, dict) and v.get("parent"))
+                snap.frames = sorted(names)
+            model = self.motion.robot.model() if self.motion is not None else None
+            if model is not None and model.groups is not None:
+                snap.groups = sorted(model.groups)
+            return snap
+        except Exception as exc:  # noqa: BLE001 - never break the GUI for a graph query
+            self.error.emit(f"graph query failed: {exc}")
+            return None
 
     def candidate_progress(self) -> tuple:
         if self.motion is None:

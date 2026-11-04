@@ -104,6 +104,10 @@ class AcquisitionTab(QWidget):
         self.candidate_label = QLabel("no candidate poses")
         self.motion_label = QLabel("")
         self.motion_label.setWordWrap(True)
+        self.motion_block_label = QLabel("")
+        self.motion_block_label.setWordWrap(True)
+        self.motion_block_label.setStyleSheet("color: #c62828;")
+        self.motion_block_label.setVisible(False)
         motion = QGroupBox("Motion")
         m = QGridLayout(motion)
         m.addWidget(QLabel("Velocity scaling"), 0, 0)
@@ -118,6 +122,7 @@ class AcquisitionTab(QWidget):
         m.addWidget(self.stop_btn, 4, 1)
         m.addWidget(self.candidate_label, 5, 0, 1, 2)
         m.addWidget(self.motion_label, 6, 0, 1, 2)
+        m.addWidget(self.motion_block_label, 7, 0, 1, 2)
 
         # -- compute -------------------------------------------------------
         self.method = QComboBox()
@@ -232,6 +237,13 @@ class AcquisitionTab(QWidget):
             f"distances {report.distance_occupied}/5\n"
             f"distance hist [{report.distance_edges[0]:.2f}-{report.distance_edges[-1]:.2f} m]: {d}\n"
             f"tilt hist [0-60 deg, 10 deg bins]: {t}")
+
+    def set_motion_enabled(self, enabled: bool, reason: str = "") -> None:
+        """Enable Plan/Execute/pose buttons only when the MoveIt names are valid (Stop always works)."""
+        for b in (self.plan_btn, self.exec_btn, self.next_btn, self.random_btn, self.hemi_btn):
+            b.setEnabled(enabled)
+        self.motion_block_label.setVisible(not enabled)
+        self.motion_block_label.setText(f"Motion disabled: {reason}" if reason else "")
 
     def set_computing(self, busy: bool) -> None:
         self.compute_btn.setEnabled(not busy)
